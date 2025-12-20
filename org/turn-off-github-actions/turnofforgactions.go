@@ -30,7 +30,8 @@ func main() {
 	}
 
 	// Create GitHub client with authentication for listing repos
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	defer cancel()
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: token},
 	)
@@ -59,6 +60,10 @@ func main() {
 
 	// Loop through repositories and disable GitHub Actions using direct API calls
 	for _, repo := range allRepos {
+		if repo.Name == nil {
+			log.Printf("Skipping repository with nil name")
+			continue
+		}
 		log.Printf("Updating repository: %s", *repo.Name)
 
 		// Create request to disable GitHub Actions
@@ -70,18 +75,17 @@ func main() {
 			continue
 		}
 
-		req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonPayload))
+		req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(jsonPayload))
 		if err != nil {
 			log.Printf("Error creating request for %s: %v", *repo.Name, err)
 			continue
 		}
 
-		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Accept", "application/vnd.github.v3+json")
 		req.Header.Set("Content-Type", "application/json")
 
 		// Send request
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := tc.Do(req)
 		if err != nil {
 			log.Printf("Error sending request for %s: %v", *repo.Name, err)
 			continue
@@ -89,12 +93,9 @@ func main() {
 
 		// Read and handle response
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			log.Printf("Error reading response for %s: %v", *repo.Name, err)
-			continue
-		}
-		errBody := resp.Body.Close()
-		if errBody != nil {
 			continue
 		}
 
@@ -105,8 +106,8 @@ func main() {
 				*repo.Name, resp.StatusCode, string(body))
 		}
 
-		// Optional: Add a delay to avoid hitting API rate limits
-		time.Sleep(1 * time.Second) // Uncomment if needed
+		// Add a delay to avoid hitting API rate limits
+		time.Sleep(1 * time.Second)
 	}
 
 	log.Println("Finished updating all repositories.")
