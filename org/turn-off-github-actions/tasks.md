@@ -24,5 +24,11 @@
 
 ## Improvements (Lower Value)
 
-- [ ] **Concurrent processing** - Process repos in parallel with worker pool (limited benefit due to rate limits)
+- [x] **Concurrent processing** - N/A: Minimal benefit (~5s savings), risk of triggering abuse detection
 - [x] **Update API version header** - Use `X-GitHub-Api-Version: 2022-11-28` instead of legacy `v3`
+
+## Bug Fixes (Found in Code Review)
+
+- [x] **Fix rate limit exhaustion logic** - Line 250: condition `!success && err != nil` doesn't catch rate limit exhaustion case; should handle when `success=false` and `err=nil`
+- [x] **Guard against nil resp dereference** - Line 255: `resp.StatusCode` could panic if `resp` is nil after failed retries
+- [x] **Add nil checks to helper functions** - Lines 22, 60: `handleRateLimit` and `isRateLimited` should check for nil `resp`

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -20,6 +21,9 @@ import (
 
 // handleRateLimit checks response headers and waits if rate limit is low
 func handleRateLimit(resp *http.Response) {
+	if resp == nil {
+		return
+	}
 	remaining := resp.Header.Get("X-RateLimit-Remaining")
 	resetHeader := resp.Header.Get("X-RateLimit-Reset")
 
@@ -58,6 +62,9 @@ func handleRateLimit(resp *http.Response) {
 
 // isRateLimited checks if the response indicates a rate limit error
 func isRateLimited(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
 	if resp.StatusCode == 429 {
 		return true
 	}
@@ -93,7 +100,7 @@ func main() {
 		fmt.Println("Please provide both token and org via flags or environment variables.")
 		fmt.Println()
 		fmt.Println("Usage:")
-		fmt.Println("  turnofforgactions -token=<token> -org=<org> [--dry-run]")
+		fmt.Println("  turnofforgactions -token=<token> -org=<org> [-dry-run]")
 		fmt.Println()
 		fmt.Println("Or set environment variables:")
 		fmt.Println("  export GITHUB_TOKEN=your_personal_access_token")
@@ -119,9 +126,26 @@ func main() {
 	for {
 		repos, resp, err := client.Repositories.ListByOrg(ctx, org, opt)
 		if err != nil {
+			// Check if it's a rate limit error
+			if rateLimitErr, ok := err.(*github.RateLimitError); ok {
+				waitDuration := time.Until(rateLimitErr.Rate.Reset.Time)
+				log.Printf("Rate limited while fetching repositories, waiting %v until reset...", waitDuration.Round(time.Second))
+				time.Sleep(waitDuration + time.Second)
+				continue
+			}
 			log.Fatalf("Error fetching repositories: %v", err)
 		}
 		allRepos = append(allRepos, repos...)
+
+		// Check rate limit and wait if getting low
+		if resp.Rate.Remaining < 10 {
+			waitDuration := time.Until(resp.Rate.Reset.Time)
+			if waitDuration > 0 {
+				log.Printf("Rate limit low (%d remaining), waiting %v until reset", resp.Rate.Remaining, waitDuration.Round(time.Second))
+				time.Sleep(waitDuration + time.Second)
+			}
+		}
+
 		if resp.NextPage == 0 {
 			break
 		}
@@ -169,7 +193,7 @@ func main() {
 		log.Printf("Updating repository: %s", *repo.Name)
 
 		// Create request to disable GitHub Actions
-		url := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/permissions", org, *repo.Name)
+		apiURL := fmt.Sprintf("https://api.github.com/repos/%s/%s/actions/permissions", url.PathEscape(org), url.PathEscape(*repo.Name))
 		payload := map[string]bool{"enabled": false}
 		jsonPayload, err := json.Marshal(payload)
 		if err != nil {
@@ -178,7 +202,7 @@ func main() {
 			continue
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(jsonPayload))
+		req, err := http.NewRequestWithContext(ctx, "PUT", apiURL, bytes.NewBuffer(jsonPayload))
 		if err != nil {
 			log.Printf("Error creating request for %s: %v", *repo.Name, err)
 			failedCount++
@@ -198,7 +222,7 @@ func main() {
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			if attempt > 0 {
 				// Recreate request for retry (body was consumed)
-				req, err = http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(jsonPayload))
+				req, err = http.NewRequestWithContext(ctx, "PUT", apiURL, bytes.NewBuffer(jsonPayload))
 				if err != nil {
 					log.Printf("Error creating retry request for %s: %v", *repo.Name, err)
 					break
@@ -215,7 +239,7 @@ func main() {
 			}
 
 			body, err = io.ReadAll(resp.Body)
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if err != nil {
 				log.Printf("Error reading response for %s: %v", *repo.Name, err)
 				break
@@ -247,17 +271,27 @@ func main() {
 			break
 		}
 
-		if !success && err != nil {
-			failedCount++
+		if !success {
+			if err != nil {
+				// Request or read error
+				failedCount++
+			} else {
+				// Rate limit exhaustion (all retries failed due to rate limiting)
+				log.Printf("Rate limit exhausted for %s after %d attempts", *repo.Name, maxRetries)
+				failedCount++
+			}
 			continue
 		}
 
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("Successfully disabled GitHub Actions for repository: %s", *repo.Name)
 			successCount++
-		} else {
+		} else if resp != nil {
 			log.Printf("Failed to disable GitHub Actions for %s. Status: %d, Response: %s",
 				*repo.Name, resp.StatusCode, string(body))
+			failedCount++
+		} else {
+			log.Printf("Failed to disable GitHub Actions for %s: no response", *repo.Name)
 			failedCount++
 		}
 
