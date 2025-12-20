@@ -11,11 +11,64 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"time"
 
 	"github.com/google/go-github/v72/github"
 	"golang.org/x/oauth2"
 )
+
+// handleRateLimit checks response headers and waits if rate limit is low
+func handleRateLimit(resp *http.Response) {
+	remaining := resp.Header.Get("X-RateLimit-Remaining")
+	resetHeader := resp.Header.Get("X-RateLimit-Reset")
+
+	if remaining == "" {
+		return
+	}
+
+	remainingInt, err := strconv.Atoi(remaining)
+	if err != nil {
+		return
+	}
+
+	// If we have plenty of quota, no delay needed
+	if remainingInt > 100 {
+		return
+	}
+
+	// If quota is getting low, add a small delay
+	if remainingInt > 10 {
+		time.Sleep(100 * time.Millisecond)
+		return
+	}
+
+	// If quota is very low, wait until reset
+	if resetHeader != "" {
+		resetTime, err := strconv.ParseInt(resetHeader, 10, 64)
+		if err == nil {
+			waitDuration := time.Until(time.Unix(resetTime, 0))
+			if waitDuration > 0 {
+				log.Printf("Rate limit low (%d remaining), waiting %v until reset", remainingInt, waitDuration.Round(time.Second))
+				time.Sleep(waitDuration + time.Second)
+			}
+		}
+	}
+}
+
+// isRateLimited checks if the response indicates a rate limit error
+func isRateLimited(resp *http.Response) bool {
+	if resp.StatusCode == 429 {
+		return true
+	}
+	if resp.StatusCode == 403 {
+		remaining := resp.Header.Get("X-RateLimit-Remaining")
+		if remaining == "0" {
+			return true
+		}
+	}
+	return false
+}
 
 func main() {
 	// Parse command-line flags
@@ -136,19 +189,65 @@ func main() {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-		// Send request
-		resp, err := tc.Do(req)
-		if err != nil {
-			log.Printf("Error sending request for %s: %v", *repo.Name, err)
-			failedCount++
-			continue
+		// Send request with retry logic for rate limits
+		var resp *http.Response
+		var body []byte
+		maxRetries := 3
+		success := false
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				// Recreate request for retry (body was consumed)
+				req, err = http.NewRequestWithContext(ctx, "PUT", url, bytes.NewBuffer(jsonPayload))
+				if err != nil {
+					log.Printf("Error creating retry request for %s: %v", *repo.Name, err)
+					break
+				}
+				req.Header.Set("Accept", "application/vnd.github+json")
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+			}
+
+			resp, err = tc.Do(req)
+			if err != nil {
+				log.Printf("Error sending request for %s: %v", *repo.Name, err)
+				break
+			}
+
+			body, err = io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				log.Printf("Error reading response for %s: %v", *repo.Name, err)
+				break
+			}
+
+			// Check for rate limiting
+			if isRateLimited(resp) {
+				resetHeader := resp.Header.Get("X-RateLimit-Reset")
+				if resetHeader != "" {
+					resetTime, parseErr := strconv.ParseInt(resetHeader, 10, 64)
+					if parseErr == nil {
+						waitDuration := time.Until(time.Unix(resetTime, 0))
+						if waitDuration > 0 {
+							log.Printf("Rate limited, waiting %v until reset (attempt %d/%d)", waitDuration.Round(time.Second), attempt+1, maxRetries)
+							time.Sleep(waitDuration + time.Second)
+							continue
+						}
+					}
+				}
+				// Exponential backoff if no reset header
+				backoff := time.Duration(1<<attempt) * time.Second
+				log.Printf("Rate limited, backing off %v (attempt %d/%d)", backoff, attempt+1, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+
+			// Success or non-rate-limit error
+			success = true
+			break
 		}
 
-		// Read and handle response
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			log.Printf("Error reading response for %s: %v", *repo.Name, err)
+		if !success && err != nil {
 			failedCount++
 			continue
 		}
@@ -162,8 +261,8 @@ func main() {
 			failedCount++
 		}
 
-		// Add a delay to avoid hitting API rate limits
-		time.Sleep(1 * time.Second)
+		// Adaptive rate limit handling
+		handleRateLimit(resp)
 	}
 
 	log.Println("Finished updating all repositories.")

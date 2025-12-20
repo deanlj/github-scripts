@@ -20,7 +20,7 @@
 
 - [x] **Add command-line flags** - Support `--token`, `--org`, `--dry-run` flags alongside env vars
 - [x] **Filter by repo name** - Add option to only process repos matching a pattern
-- [ ] **Better rate limit handling** - Check `X-RateLimit` headers instead of fixed 1s delay
+- [x] **Better rate limit handling** - Check `X-RateLimit` headers instead of fixed 1s delay
 
 ## Improvements (Lower Value)
 
