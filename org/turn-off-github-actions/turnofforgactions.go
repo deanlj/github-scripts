@@ -19,6 +19,54 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// LogEntry represents a single log entry in JSONL format
+type LogEntry struct {
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`
+	Repo      string `json:"repo,omitempty"`
+	Action    string `json:"action,omitempty"`
+	Status    string `json:"status,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Succeeded int    `json:"succeeded,omitempty"`
+	Failed    int    `json:"failed,omitempty"`
+	Skipped   int    `json:"skipped,omitempty"`
+}
+
+// JSONLogger handles writing log entries to a JSONL file
+type JSONLogger struct {
+	file    *os.File
+	encoder *json.Encoder
+}
+
+// NewJSONLogger creates a new JSON logger for the given file path
+func NewJSONLogger(filePath string) (*JSONLogger, error) {
+	file, err := os.Create(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log file: %w", err)
+	}
+	return &JSONLogger{
+		file:    file,
+		encoder: json.NewEncoder(file),
+	}, nil
+}
+
+// Log writes a log entry to the JSONL file
+func (l *JSONLogger) Log(entry LogEntry) {
+	if l == nil || l.encoder == nil {
+		return
+	}
+	entry.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	_ = l.encoder.Encode(entry)
+}
+
+// Close closes the log file
+func (l *JSONLogger) Close() error {
+	if l == nil || l.file == nil {
+		return nil
+	}
+	return l.file.Close()
+}
+
 // handleRateLimit checks response headers and waits if rate limit is low
 func handleRateLimit(resp *http.Response) {
 	if resp == nil {
@@ -83,7 +131,33 @@ func main() {
 	orgFlag := flag.String("org", "", "GitHub organization name (or set GITHUB_ORG env var)")
 	filterFlag := flag.String("filter", "", "Only process repos matching pattern (supports * and ? wildcards)")
 	dryRun := flag.Bool("dry-run", false, "Preview changes without making them")
+	logFlag := flag.String("log", "", "Write JSONL log to file (optional filename, defaults to timestamp-based name)")
 	flag.Parse()
+
+	// Setup JSON logger if -log flag is provided
+	var jsonLogger *JSONLogger
+	// Check if -log was explicitly provided (even without value)
+	logFlagProvided := false
+	for _, arg := range os.Args[1:] {
+		if arg == "-log" || arg == "--log" || len(arg) > 4 && arg[:5] == "-log=" {
+			logFlagProvided = true
+			break
+		}
+	}
+	if logFlagProvided {
+		logFile := *logFlag
+		if logFile == "" {
+			// Generate default filename with timestamp
+			logFile = time.Now().Format("2006-01-02-15-04-05") + "-turnofforgactions.log"
+		}
+		var err error
+		jsonLogger, err = NewJSONLogger(logFile)
+		if err != nil {
+			log.Fatalf("Failed to create log file: %v", err)
+		}
+		defer jsonLogger.Close()
+		log.Printf("Writing JSONL log to: %s", logFile)
+	}
 
 	// Get credentials from flags or environment variables
 	token := *tokenFlag
@@ -165,11 +239,13 @@ func main() {
 	for _, repo := range allRepos {
 		if repo.Name == nil {
 			log.Printf("Skipping repository with nil name")
+			jsonLogger.Log(LogEntry{Type: "repo", Action: "skip", Status: "skipped", Message: "Repository has nil name"})
 			skippedCount++
 			continue
 		}
 		if repo.Archived != nil && *repo.Archived {
 			log.Printf("Skipping archived repository: %s", *repo.Name)
+			jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "skip", Status: "skipped", Message: "Repository is archived"})
 			skippedCount++
 			continue
 		}
@@ -180,12 +256,14 @@ func main() {
 				os.Exit(1)
 			}
 			if !matched {
+				jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "skip", Status: "skipped", Message: "Does not match filter pattern"})
 				skippedCount++
 				continue
 			}
 		}
 		if *dryRun {
 			log.Printf("[DRY-RUN] Would disable GitHub Actions for: %s", *repo.Name)
+			jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "dry_run", Message: "Would disable GitHub Actions"})
 			successCount++
 			continue
 		}
@@ -274,10 +352,12 @@ func main() {
 		if !success {
 			if err != nil {
 				// Request or read error
+				jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "failed", Message: err.Error()})
 				failedCount++
 			} else {
 				// Rate limit exhaustion (all retries failed due to rate limiting)
 				log.Printf("Rate limit exhausted for %s after %d attempts", *repo.Name, maxRetries)
+				jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "failed", Message: fmt.Sprintf("Rate limit exhausted after %d attempts", maxRetries)})
 				failedCount++
 			}
 			continue
@@ -285,13 +365,16 @@ func main() {
 
 		if resp != nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			log.Printf("Successfully disabled GitHub Actions for repository: %s", *repo.Name)
+			jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "success", Message: "Successfully disabled GitHub Actions"})
 			successCount++
 		} else if resp != nil {
 			log.Printf("Failed to disable GitHub Actions for %s. Status: %d, Response: %s",
 				*repo.Name, resp.StatusCode, string(body))
+			jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "failed", Message: fmt.Sprintf("Status %d: %s", resp.StatusCode, string(body))})
 			failedCount++
 		} else {
 			log.Printf("Failed to disable GitHub Actions for %s: no response", *repo.Name)
+			jsonLogger.Log(LogEntry{Type: "repo", Repo: *repo.Name, Action: "disable_actions", Status: "failed", Message: "No response received"})
 			failedCount++
 		}
 
@@ -301,4 +384,13 @@ func main() {
 
 	log.Println("Finished updating all repositories.")
 	log.Printf("Summary: %d succeeded, %d failed, %d skipped", successCount, failedCount, skippedCount)
+
+	// Write summary to JSONL log
+	jsonLogger.Log(LogEntry{
+		Type:      "summary",
+		Succeeded: successCount,
+		Failed:    failedCount,
+		Skipped:   skippedCount,
+		Message:   "Finished updating all repositories",
+	})
 }

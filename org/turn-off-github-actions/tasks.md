@@ -32,3 +32,14 @@
 - [x] **Fix rate limit exhaustion logic** - Line 250: condition `!success && err != nil` doesn't catch rate limit exhaustion case; should handle when `success=false` and `err=nil`
 - [x] **Guard against nil resp dereference** - Line 255: `resp.StatusCode` could panic if `resp` is nil after failed retries
 - [x] **Add nil checks to helper functions** - Lines 22, 60: `handleRateLimit` and `isRateLimited` should check for nil `resp`
+
+## New Feature: JSONL Log File
+
+- [x] **Add -log flag** - Add optional flag `-log=<filename>` that accepts an optional filename argument
+- [x] **Generate default filename** - If `-log` provided without filename, generate `YYYY-MM-DD-HH-MM-SS-turnofforgactions.log`
+- [x] **Create LogEntry struct** - Define struct for JSONL log entries with fields: timestamp, repo, action, status, message, etc.
+- [x] **Create JSON logger** - Helper function to write LogEntry structs as JSON lines to file
+- [x] **Open/close log file** - Open file at start (if flag set), defer close, handle errors
+- [x] **Log each repo action** - Write JSONL entry for: skipped, dry-run, success, failed, rate-limited
+- [x] **Log summary** - Write final summary entry with totals
+- [x] **Dual output** - Continue logging to stdout while also writing to file
